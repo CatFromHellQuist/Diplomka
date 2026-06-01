@@ -1,0 +1,497 @@
+# Copyright (C) 2026 Georgy Parhomenko
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import threading
+import os
+import sys
+import configparser
+from pathlib import Path
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import re
+import warnings
+from collections import defaultdict
+
+"""
+
+    TODO:
+    1) Переделать приложуху:
+        1. "Я в дизайн не алё"
+        2. Пофиксить прогресс-бар
+        3. Добавить акт.редакт зав.отделением и секретаря + запихнуть в конфиг
+    2) Добавить поддержку списка студентов
+    3) 271 стр.к., 289 стр.к.
+    4) 214 стр.к. - возможно понадобиться добавить активный редакт
+
+    Копипаст для сборки с умен.размера(пандас гавна поел, "но что имеем"): pyinstaller --onefile --noconfirm --windowed --name="VedomostiGenerator" vedomosti_app.py
+"""
+
+# КЛАСС ПРИЛОЖЕНИЯ (нужно будет переделать под чистую, ибо "руки-крюки")
+class VedomostiApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Генератор ведомостей из журнала учёта")
+        self.root.geometry("750x650")
+        self.root.resizable(True, True)
+
+        # Переменные
+        self.input_file_path = tk.StringVar()
+        self.output_dir_path = tk.StringVar(value="generated_vedomosti")
+        self.student_count = tk.IntVar(value=25)
+
+        # Файл конфига
+        self.config_file = "config.ini"
+        self.load_config()
+
+        # Создание интерфейса
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Рамка выбора входного файла
+        file_frame = tk.LabelFrame(self.root, text="1. Выберите файл журнала", padx=5, pady=5)
+        file_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Entry(file_frame, textvariable=self.input_file_path, width=60).pack(side="left", padx=5)
+        tk.Button(file_frame, text="Обзор...", command=self.select_input_file).pack(side="left", padx=5)
+
+        # Рамка выбора выходной папки
+        output_frame = tk.LabelFrame(self.root, text="2. Выберите папку для результатов", padx=5, pady=5)
+        output_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Entry(output_frame, textvariable=self.output_dir_path, width=60).pack(side="left", padx=5)
+        tk.Button(output_frame, text="Обзор...", command=self.select_output_dir).pack(side="left", padx=5)
+
+        # Рамка настроек
+        settings_frame = tk.LabelFrame(self.root, text="3. Настройки", padx=5, pady=5)
+        settings_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Label(settings_frame, text="Количество студентов-заглушек:").pack(side="left", padx=5)
+        tk.Spinbox(settings_frame, from_=1, to=100, textvariable=self.student_count, width=5).pack(side="left", padx=5)
+
+        # Прогресс-бар
+        self.progress = ttk.Progressbar(self.root, mode='indeterminate', length=400)
+        self.progress.pack(pady=5)
+
+        # Кнопки действий
+        buttons_frame = tk.Frame(self.root)
+        buttons_frame.pack(fill="x", padx=10, pady=5)
+
+        self.generate_btn = tk.Button(buttons_frame, text="4. Сгенерировать ведомости", command=self.start_generation,
+                                      bg="lightblue", width=25)
+        self.generate_btn.pack(side="left", padx=5)
+
+        self.open_btn = tk.Button(buttons_frame, text="Открыть папку с результатами", command=self.open_output_folder,
+                                  state="disabled", width=25)
+        self.open_btn.pack(side="left", padx=5)
+
+        # Логи
+        log_frame = tk.LabelFrame(self.root, text="Лог выполнения", padx=5, pady=5)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=20, width=80, wrap=tk.WORD)
+        self.log_text.pack(fill="both", expand=True)
+
+    # НАСТРОЙКИ
+    def load_config(self):
+        config = configparser.ConfigParser()
+        if os.path.exists(self.config_file):
+            try:
+                config.read(self.config_file, encoding='utf-8')
+                if 'Settings' in config:
+                    self.input_file_path.set(config['Settings'].get('input_file', ''))
+                    self.output_dir_path.set(config['Settings'].get('output_dir', 'generated_vedomosti'))
+                    self.student_count.set(int(config['Settings'].get('student_count', '25')))
+            except Exception as e:
+                print(f"Ошибка загрузки конфига: {e}")
+
+    def save_config(self):
+        config = configparser.ConfigParser()
+        config['Settings'] = {
+            'input_file': self.input_file_path.get(),
+            'output_dir': self.output_dir_path.get(),
+            'student_count': str(self.student_count.get())
+        }
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                config.write(f)
+        except Exception as e:
+            print(f"Ошибка сохранения конфига: {e}")
+
+    # ОБРАБОТЧИКИ
+    def select_input_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Выберите файл журнала учёта",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.input_file_path.set(file_path)
+            self.log(f"Выбран файл: {file_path}")
+            self.save_config()
+
+    def select_output_dir(self):
+        dir_path = filedialog.askdirectory(title="Выберите папку для сохранения результатов")
+        if dir_path:
+            self.output_dir_path.set(dir_path)
+            self.log(f"Папка для результатов: {dir_path}")
+            self.save_config()
+
+    def log(self, message):
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.root.update_idletasks()
+
+    # Меме момент
+    def start_generation(self):
+        if not self.input_file_path.get():
+            messagebox.showerror("Ошибка", "Сначала выберите файл журнала!")
+            return
+        if not self.output_dir_path.get():
+            messagebox.showerror("Ошибка", "Укажите папку для сохранения результатов!")
+            return
+
+        self.generate_btn.config(state="disabled")
+        self.open_btn.config(state="disabled")
+        self.log_text.delete(1.0, tk.END)
+        self.log("Начало генерации ведомостей...")
+        self.progress.start(10)
+
+        thread = threading.Thread(target=self.run_generation, daemon=True)
+        thread.start()
+
+    def run_generation(self):
+        try:
+            global STUDENT_COUNT, INPUT_FILE, OUTPUT_DIR
+            STUDENT_COUNT = self.student_count.get()
+            INPUT_FILE = self.input_file_path.get()
+            OUTPUT_DIR = self.output_dir_path.get()
+
+            self.create_vedomosti()   # основная логика
+
+            self.log("Генерация завершена успешно!")
+            self.progress.stop()
+            self.open_btn.config(state="normal")
+            self.save_config()
+        except Exception as e:
+            self.log(f"ОШИБКА: {e}")
+            messagebox.showerror("Ошибка", f"При генерации произошла ошибка:\n{e}")
+            self.progress.stop()
+        finally:
+            self.generate_btn.config(state="normal")
+
+    def open_output_folder(self):
+        if os.path.exists(OUTPUT_DIR):
+            os.startfile(OUTPUT_DIR)
+        else:
+            messagebox.showwarning("Папка не найдена", "Сначала сгенерируйте ведомости.")
+
+    # ОСНОВНАЯ ЛОГИКА ГЕНЕРАЦИИ (сокращённо, но полностью рабочая(don't tuch it!))
+    def create_vedomosti(self):
+        warnings.filterwarnings("ignore", category=UserWarning, module='openpyxl')
+        
+        # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (это гавно не умеет в римку, надо будет пофиксить)
+        def course_to_roman(sheet_name):
+            match = re.search(r'(\d+)', sheet_name)
+            if not match:
+                return '?'
+            num = int(match.group(1))
+            roman_map = {1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V'}
+            return roman_map.get(num, str(num))
+
+        def parse_groups(group_cell):
+            if pd.isna(group_cell):
+                return []
+            parts = [g.strip() for g in str(group_cell).split(',')]
+            result = []
+            for g in parts:
+                if g.endswith('к'):
+                    result.append((g, False))
+                else:
+                    result.append((g, True))
+            return result
+
+        # СОКРАЩЁНКИ
+        def get_specialty(group_name):
+            spec_map = {
+                'КС': '09.02.01 «Компьютерные системы и комплексы»',
+                'СА': '09.02.01 «Компьютерные системы и комплексы»',
+                'Т': '15.02.01 «Технология машиностроения»',
+                'ТМ': '15.02.01 «Технология машиностроения»',
+                'ТД': '23.02.07 «Техническое обслуживание и ремонт двигателей, систем и агрегатов автомобилей»',
+                'УМ': '15.02.01 «Технология машиностроения»',
+                'УП': '27.02.07 «Управление качеством продукции, процессов и услуг (по отраслям)»',
+                'Э': '13.02.13 «Эксплуатация и обслуживание электрического и электромеханического оборудования (по отраслям)»',
+                'Км': '15.02.01 «Технология машиностроения»',
+            }
+            prefix = group_name.split('-')[0] if '-' in group_name else group_name[:2]
+            return spec_map.get(prefix, '___________________')
+
+        def determine_ved_type(row):
+            control = str(row['Вид контроля']).upper() if not pd.isna(row['Вид контроля']) else ''
+            discipline = str(row['Дисциплина']) if not pd.isna(row['Дисциплина']) else ''
+            if 'квалификационный' in discipline.lower() or (control == 'Э' and discipline.startswith('ПМ.')):
+                return 'qualifying'
+            if control in ('Э', 'КП'):
+                return 'exam'
+            return 'credit'
+
+        def safe_int(value):
+            if pd.isna(value):
+                return None
+            try:
+                if isinstance(value, str) and '.' in value:
+                    value = value.split('.')[0]
+                return int(float(value))
+            except (ValueError, TypeError):
+                return None
+
+        def safe_str(value):
+            return str(value) if not pd.isna(value) else ''
+
+        def sanitize_sheet_title(title, fallback="Ведомость"):
+            if not title or pd.isna(title):
+                return fallback[:31]
+            cleaned = re.sub(r'[\\/*?:"<>|]', '_', str(title))
+            cleaned = re.sub(r'_+', '_', cleaned).strip('_')
+            if not cleaned or cleaned.isspace() or all(c == '_' for c in cleaned):
+                return fallback[:31]
+            return cleaned[:31]
+
+        def format_teacher_signature(teacher_str):
+            teacher = safe_str(teacher_str).strip()
+            if not teacher:
+                return ''
+            parts = teacher.split()
+            if len(parts) == 1:
+                return teacher
+            surname = parts[0]
+            initials = ''.join(parts[1:])
+            formatted_initials = '.'.join(initials) + '.' if initials else ''
+            return f"{formatted_initials} {surname}".strip()
+
+        # Переделать и оптимизировать всё под чисту, но не щас
+        def fill_vedomosti_sheet(ws, ved_number, discipline, teacher, group_name, course_roman, ved_type, row):
+            default_font = Font(name='Times New Roman', size=12, bold=False)
+            bold_font = Font(name='Times New Roman', size=12, bold=True)
+            grade_font = Font(name='Times New Roman', size=10, bold=False)
+            thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                 top=Side(style='thin'), bottom=Side(style='thin'))
+
+            ws.merge_cells('A1:F1')
+            ws['A1'] = ('государственное бюджетное профессиональное образовательное учреждение\n'
+                        '«Пермский политехнический колледж имени Н.Г. Славянова»')
+            ws['A1'].font = default_font
+            ws['A1'].alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            ws.row_dimensions[1].height = 40
+            ws.column_dimensions['A'].width = 40
+            for col in ['B','C','D','E','F']:
+                ws.column_dimensions[col].width = 20
+
+            # Когда-нибудь переделать, но не сейчас
+            ws.merge_cells('A3:F3')
+            ved_title = 'ЭКЗАМЕНАЦИОННАЯ ВЕДОМОСТЬ' if ved_type in ('exam', 'qualifying') else 'ЗАЧЕТНАЯ ВЕДОМОСТЬ'
+            ws['A3'] = f'{ved_title} № {ved_number}'
+            ws['A3'].font = bold_font
+            ws['A3'].alignment = Alignment(horizontal='center')
+
+            ws.merge_cells('A5:F5')
+            if ved_type == 'qualifying':
+                desc = f'Квалификационный экзамен по {discipline}'
+            else:
+                desc = f'по учебной дисциплине {discipline}'
+            ws['A5'] = f'{desc}\nкурса {course_roman} группы {group_name}'
+            ws['A5'].font = default_font
+            ws['A5'].alignment = Alignment(horizontal='center', wrap_text=True)
+
+            specialty = get_specialty(group_name)
+            ws.merge_cells('A6:F6')
+            ws['A6'] = f'Специальность {specialty}'
+            ws['A6'].font = default_font
+            ws['A6'].alignment = Alignment(horizontal='center')
+
+            ws.merge_cells('A7:F7')
+            ws['A7'] = f'Преподаватель {teacher}'
+            ws['A7'].font = default_font
+            ws['A7'].alignment = Alignment(horizontal='center')
+
+            if ved_type == 'exam':
+                ws.merge_cells('A9:A10')
+                ws.merge_cells('B9:B10')
+                ws.merge_cells('C9:E9')
+                ws.merge_cells('F9:F10')
+                ws['A9'] = '№ п/п'
+                ws['B9'] = 'Фамилия, имя и отчество\nобучающегося'
+                ws['C9'] = 'Оценка по экзамену'
+                ws['F9'] = 'Примечание'
+                ws['C10'] = 'письменно'
+                ws['D10'] = 'устно'
+                ws['E10'] = 'общая'
+                for r in [9,10]:
+                    for c in range(1,7):
+                        cell = ws.cell(row=r, column=c)
+                        if r == 9:
+                            if c in [1,2,6]:
+                                cell.font = default_font
+                            elif c == 3:
+                                cell.font = grade_font
+                        else:
+                            if c in [3,4,5]:
+                                cell.font = grade_font
+                            else:
+                                cell.font = default_font
+                        cell.alignment = Alignment(horizontal='center', wrap_text=True)
+                        cell.border = thin_border
+                start_data_row = 11
+            elif ved_type == 'qualifying':
+                headers = ['№ п/п', 'Фамилия, имя и отчество\nобучающегося',
+                           'Оценка за\nэкзамен', 'Освоение профессионального модуля', 'Примечание']
+                r = 9
+                for idx, h in enumerate(headers,1):
+                    cell = ws.cell(row=r, column=idx, value=h)
+                    cell.font = default_font
+                    cell.alignment = Alignment(horizontal='center', wrap_text=True)
+                    cell.border = thin_border
+                start_data_row = 10
+            else:  # credit -ы
+                headers = ['№ п/п', 'Фамилия, имя и отчество\nобучающегося',
+                           'Отметка о сдаче зачета\n/ оценка за дифференцированный зачет', 'Примечание']
+                r = 9
+                for idx, h in enumerate(headers,1):
+                    cell = ws.cell(row=r, column=idx, value=h)
+                    if idx == 3:
+                        cell.font = grade_font
+                    else:
+                        cell.font = default_font
+                    cell.alignment = Alignment(horizontal='center', wrap_text=True)
+                    cell.border = thin_border
+                start_data_row = 10
+
+            for i in range(1, STUDENT_COUNT+1):
+                data_row = start_data_row + i - 1
+                cell = ws.cell(row=data_row, column=1, value=i)
+                cell.font = grade_font
+                cell.alignment = Alignment(horizontal='center')
+                cell.border = thin_border
+                cell = ws.cell(row=data_row, column=2, value=f'Студент {i}')
+                cell.font = grade_font
+                cell.alignment = Alignment(horizontal='center')
+                cell.border = thin_border
+
+                if ved_type == 'exam':
+                    for col in [3,4,5,6]:
+                        cell = ws.cell(row=data_row, column=col)
+                        cell.font = grade_font
+                        cell.alignment = Alignment(horizontal='center')
+                        cell.border = thin_border
+                elif ved_type == 'qualifying':
+                    for col in [3,4,5]:
+                        cell = ws.cell(row=data_row, column=col)
+                        if col == 4:
+                            cell.value = 'освоен'
+                        cell.font = grade_font
+                        cell.alignment = Alignment(horizontal='center')
+                        cell.border = thin_border
+                else:  # credit
+                    for col in [3,4]:
+                        cell = ws.cell(row=data_row, column=col)
+                        cell.font = grade_font
+                        cell.alignment = Alignment(horizontal='center')
+                        cell.border = thin_border
+
+            # Чекай todo list, тут будет над чем поработать
+            sign_row = start_data_row + STUDENT_COUNT + 1
+            ws.merge_cells(f'A{sign_row}:F{sign_row}')
+            ws.cell(row=sign_row, column=1, value='Дата проведения «____» _______________ 202_ г.').font = default_font
+            sign_row += 2
+            ws.cell(row=sign_row, column=1, value='Подпись преподавателя').font = default_font
+            ws.cell(row=sign_row, column=4, value='_____________').font = default_font
+            ws.cell(row=sign_row, column=6, value=format_teacher_signature(teacher)).font = default_font
+            sign_row += 2
+            ws.cell(row=sign_row, column=1, value='Секретарь учебной части').font = default_font
+            ws.cell(row=sign_row, column=4, value='_____________').font = default_font
+            ws.cell(row=sign_row, column=6, value='К.Д. Шаткова').font = default_font
+            sign_row += 2
+            ws.cell(row=sign_row, column=1, value='Зав. отделением').font = default_font
+            ws.cell(row=sign_row, column=4, value='_____________').font = default_font
+            ws.cell(row=sign_row, column=6, value='Н. Ф. Никулина').font = default_font
+
+        def create_workbook_for_group(group_name, is_budget, course_roman, records):
+            if not records:
+                return
+            wb = Workbook()
+            wb.remove(wb.active)
+            for ved_number, discipline, teacher, ved_type, row in records:
+                base_name = f"{discipline} (№{ved_number})" if discipline else f"Ведомость №{ved_number}"
+                sheet_title = sanitize_sheet_title(base_name, fallback=f"Ведомость_{ved_number}")
+                ws = wb.create_sheet(title=sheet_title)
+                fill_vedomosti_sheet(ws, ved_number, discipline, teacher, group_name, course_roman, ved_type, row)
+            safe_group = group_name.replace('/', '_')
+            suffix = 'вб' if not is_budget else 'бюджет'
+            filename = f'{safe_group}_{suffix}.xlsx'
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            wb.save(filepath)
+            self.log(f"  Создан файл: {filepath} ({len(records)} листов)")
+
+        # ЛОГИКА 2
+        if not os.path.exists(OUTPUT_DIR):
+            os.makedirs(OUTPUT_DIR)
+
+        xls = pd.ExcelFile(INPUT_FILE)
+        groups_data = defaultdict(list)
+        column_names = ['Группа', 'Дисциплина', 'Вид контроля', 'Семестр', 'Преподаватель',
+                        '№ ведомости бюджет', '№ ведомости в/б', 'Ведомость', 'Зачетка',
+                        'Замечания', 'Проверено', '', '', '']
+
+        for sheet_name in xls.sheet_names:
+            if 'КУРС' not in sheet_name:
+                continue
+            self.log(f"Обработка листа: {sheet_name}")
+            df = pd.read_excel(xls, sheet_name, header=None, skiprows=2)
+            df.columns = column_names[:len(df.columns)]
+            df = df.dropna(how='all')
+            course_roman = course_to_roman(sheet_name)
+
+            for idx, row in df.iterrows():
+                groups_str = row['Группа']
+                if pd.isna(groups_str):
+                    continue
+                groups = parse_groups(groups_str)
+                discipline = safe_str(row['Дисциплина'])
+                teacher = safe_str(row['Преподаватель'])
+                num_bud = safe_int(row['№ ведомости бюджет'])
+                num_vb = safe_int(row['№ ведомости в/б'])
+
+                for group_name, is_budget in groups:
+                    ved_number = num_bud if is_budget else num_vb
+                    if ved_number is None:
+                        continue
+                    ved_type = determine_ved_type(row)
+                    key = (group_name, is_budget, course_roman)
+                    groups_data[key].append((ved_number, discipline, teacher, ved_type, row))
+
+        self.log("Группировка завершена, создаю файлы...")
+        for (group_name, is_budget, course_roman), records in groups_data.items():
+            if records:
+                create_workbook_for_group(group_name, is_budget, course_roman, records)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = VedomostiApp(root)
+    root.mainloop()
